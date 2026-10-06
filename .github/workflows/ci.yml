@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"          # same as the Dockerfile and your local venv
+          cache: pip
+      - run: pip install -r requirements.txt pytest ruff
+      - run: ruff check --select E,F --ignore E501 .
+      - run: pytest -q
+
+  docker:
+    needs: test                            # only runs if "test" passed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t car-price-api:ci .
+      - name: Run container and smoke-test it
+        run: |
+          docker run -d --name api -p 5001:5001 car-price-api:ci
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:5001/health && break
+            sleep 2
+          done
+          curl -sf -X POST http://localhost:5001/predict \
+            -H "Content-Type: application/json" \
+            -d '{"brand":"BMW","model_year":2018,"mileage":45000,"fuel_type":"Gasoline","transmission":"A/T","hp":300,"engine_displacement":3.0,"is_v_engine":true,"accident":false,"clean_title":true}' \
+            | tee prediction.json
+          python3 -c "import json; assert json.load(open('prediction.json'))['predicted_price'] > 0"
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs api

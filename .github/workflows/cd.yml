@@ -1,0 +1,76 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write                          # allows pushing to ghcr.io
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}     # built in, you create nothing
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+  deploy-staging:
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      packages: read
+    steps:
+      - name: Deploy to ${{ vars.APP_ENV }} (simulated)
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA::7}"
+          echo "Deploying $IMAGE to ${{ vars.APP_ENV }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+          docker run -d --name api -p 5001:5001 "$IMAGE"
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:5001/health && exit 0
+            sleep 2
+          done
+          docker logs api
+          exit 1
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      packages: read
+    steps:
+      - name: Deploy to ${{ vars.APP_ENV }} (simulated)
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA::7}"
+          echo "Deploying $IMAGE to ${{ vars.APP_ENV }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+          docker run -d --name api -p 5001:5001 "$IMAGE"
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:5001/health && exit 0
+            sleep 2
+          done
+          docker logs api
+          exit 1
