@@ -1,0 +1,8 @@
+# Use the SAME versions as the training environment (see "library_versions" in model_metadata.json).
+# Pickled models can break or change results when scikit-learn / xgboost versions differ.
+scikit-learn==1.9.0
+xgboost==3.4.1
+mlflow==3.16.1
+pandas==3.0.3
+numpy==2.4.6
+joblib==1.5.3
