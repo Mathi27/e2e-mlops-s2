@@ -21,5 +21,9 @@ HOST  = os.getenv("HOST", "127.0.0.1")          # 127.0.0.1 = only this computer
 PORT  = int(os.getenv("PORT", "5001"))           # 5001, because macOS uses 5000 for AirPlay (gives a 403)
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"   # True = auto-reload + detailed errors (development only)
 
+# ---- logging ----
+LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO")                         # DEBUG, INFO, WARNING, ERROR
+LOG_PAYLOADS = os.getenv("LOG_PAYLOADS", "true").lower() == "true"    # log the (filtered) request fields? false = never log inputs
+
 # ---- app text ----
 APP_TITLE = "Used Car Price Predictor"

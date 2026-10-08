@@ -9,14 +9,17 @@ app.py - a tiny Flask REST API around the saved used-car price model.
 Run:  python app.py      then open http://127.0.0.1:5001
 """
 import json
+import logging
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 import joblib
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
 
 import config
+import monitoring
 from features import ValidationError, build_features, validate
 
 # The pickled model refers to the class `car_transformers.BrandTargetEncoder`.
@@ -25,6 +28,10 @@ sys.path.insert(0, str(config.BASE_DIR))
 import car_transformers  # noqa: E402,F401
 
 app = Flask(__name__)
+
+logger = monitoring.setup_logging(config.LOG_LEVEL)     # JSON logs on stdout
+metrics = monitoring.Metrics()                           # in-memory counters, shown at /metrics
+QUIET_ROUTES = {"/health", "/metrics"}                   # called every few seconds by Docker/Prometheus: log at DEBUG only
 
 # ----------------------------------------------------------------------------
 # 1) Load the model ONCE when the server starts (not on every request - that would be slow)
@@ -49,7 +56,8 @@ def load_model():
 
 def version_warnings(meta):
     """Pickles are fragile across library versions - warn if they differ from the training environment."""
-    import sklearn, xgboost
+    import sklearn
+    import xgboost
     trained = meta.get("library_versions", {})
     now = {"scikit-learn": sklearn.__version__, "xgboost": xgboost.__version__}
     return [f"{lib}: trained with {trained[lib]} but installed {ver}"
@@ -61,6 +69,31 @@ def known_brands():
 
 
 load_model()
+
+
+# ----------------------------------------------------------------------------
+# Request / response logging + metrics (runs around EVERY request)
+# ----------------------------------------------------------------------------
+@app.before_request
+def start_request():
+    g.start = time.perf_counter()
+    g.request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    g.log_fields = {}                                    # routes add extra (safe!) details here
+
+
+@app.after_request
+def finish_request(response):
+    seconds = time.perf_counter() - g.start
+    route = request.url_rule.rule if request.url_rule else "unmatched"     # route pattern, not raw URL -> bounded metric labels
+    metrics.observe_request(request.method, route, response.status_code, seconds)
+    response.headers["X-Request-ID"] = g.request_id                         # lets a client quote the id when reporting a problem
+
+    level = logging.DEBUG if route in QUIET_ROUTES else (
+        logging.ERROR if response.status_code >= 500 else logging.WARNING if response.status_code >= 400 else logging.INFO)
+    logger.log(level, "request", extra={"fields": {
+        "request_id": g.request_id, "method": request.method, "route": route,
+        "status": response.status_code, "latency_ms": round(seconds * 1000, 1), **g.log_fields}})
+    return response
 
 
 # ----------------------------------------------------------------------------
@@ -81,6 +114,12 @@ def health():
                    model_trained_at=STATE["meta"]["trained_at_utc"],
                    server_loaded_model_at=STATE["loaded_at"],
                    version_warnings=STATE["warnings"])
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """Counters and latency histogram in Prometheus text format (readable by humans too)."""
+    return Response(metrics.render(), mimetype="text/plain; version=0.0.4")
 
 
 @app.get("/model-info")
@@ -116,17 +155,23 @@ def predict():
     if payload is None:
         return jsonify(error="Send a JSON body with header 'Content-Type: application/json'"), 415
 
+    if config.LOG_PAYLOADS:
+        g.log_fields["input"] = monitoring.safe_payload(payload)            # allow-list + redaction, never the raw body
+
     started = time.perf_counter()
     try:
         clean, warnings = validate(payload, STATE["meta"], known_brands())   # 1. check the input
         features = build_features(clean, STATE["meta"])                      # 2. raw input -> model features
         price = float(STATE["model"].predict(features)[0])                   # 3. the actual prediction
     except ValidationError as exc:
+        g.log_fields["validation_errors"] = exc.errors
         return jsonify(error="Invalid input", details=exc.errors), 400
     except Exception as exc:                          # never leak a stack trace to the client
-        app.logger.exception("Prediction failed")
+        logger.exception("prediction failed", extra={"fields": {"request_id": g.request_id}})
         return jsonify(error="Prediction failed", detail=str(exc)), 500
 
+    g.log_fields.update(predicted_price=round(price), model=STATE["meta"]["model_name"], warnings=len(warnings))
+    metrics.count_prediction(STATE["meta"]["model_name"])
     return jsonify(predicted_price=round(price), currency="USD",
                    model=STATE["meta"]["model_name"], warnings=warnings,
                    inference_ms=round((time.perf_counter() - started) * 1000, 1))
